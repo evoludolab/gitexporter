@@ -345,6 +345,7 @@ async function readOptions (config, args) {
     const data = fs.readFileSync(config)
     const options = JSON.parse(data)
     const debug = !!options.debug || false
+    const fetch = !!options.fetch || false
     const dontShowTiming = !!options.dontShowTiming || false
     const targetRepoPath = options.targetRepoPath || 'ignore.target'
     const sourceRepoPath = options.sourceRepoPath || '.'
@@ -370,6 +371,7 @@ async function readOptions (config, args) {
     }
     return {
         debug,
+        fetch,
         dontShowTiming,
         forceReCreateRepo,
         followByLogFile,
@@ -392,6 +394,7 @@ function exit (message, code = 1) {
 async function main (config, args) {
     const options = await readOptions(config, args)
     if (options.debug) DEBUG = true
+    const fetch = options.fetch
 
     const time0 = Date.now()
     const ig = ignore().add(options.ignoredPaths)
@@ -446,6 +449,22 @@ async function main (config, args) {
                 // pass
             }
         }
+    }
+
+    // in fetch mode commits are fetched from public target repo and committed to 
+    // private source repo to allow transferring PR's on public repo to private one
+    // IMPORTANT: 
+    // - the history of the public and private repo must be identical up to the 
+    // point of the PR on the public repo! 
+    // - use gitexporter in regular mode first to sync the private repo with the 
+    // public repo BEFORE adding any commits to the public repo!
+    // - any uncommited changes in the private repo will be LOST! (ToDo: stash them?)
+    if (fetch) {
+        const temp = options.sourceRepoPath
+        options.sourceRepoPath = options.targetRepoPath
+        options.targetRepoPath = temp
+        if (DEBUG)
+            console.log('Fetch mode enabled.')
     }
 
     const targetRepo = await openOrInitRepo(options.targetRepoPath)
@@ -525,8 +544,8 @@ async function main (config, args) {
         if (isFollowByOk && isFollowByLogFileFeatureEnabled) {
             const existingCommit = existingLogState.commits[commitIndex - 1]
             if (existingCommit && existingCommit.processing) {
-                const sha = existingCommit.sha
-                const newSha = existingCommit.processing.newSha
+                const sha = (fetch ? existingCommit.processing.newSha : existingCommit.sha)
+                const newSha = (fetch ? existingCommit.sha : existingCommit.processing.newSha)
                 const hasTargetCommit = await hasCommit(targetRepo, newSha)
                 const hasSourceCommit = await hasCommit(sourceRepo, sha)
                 if (hasTargetCommit && hasSourceCommit) {
@@ -629,12 +648,12 @@ async function main (config, args) {
                 const tagSHA = (await Git.Reference.nameToId(sourceRepo, `refs/tags/${tag}`)).toString();
                 if (tagSHA === commit.sha) {
                     // lightweight tag
-                    // if (DEBUG) 
+                    if (DEBUG) 
                         console.log('Creating lightweight tag:', tag, newSha)
                     await targetRepo.createLightweightTag(newSha, tag)
                 } else {
                     // annotated tag
-                    // if (DEBUG) 
+                    if (DEBUG) 
                         console.log('Creating annotated tag:', tag, newSha)
                     await targetRepo.createTag(newSha, tag, commit.message)
                 }
