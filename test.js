@@ -12,7 +12,8 @@ async function run (command, expectStdoutLines = null) {
     if (stderr) console.error('ERROR:', stderr)
     expect(stderr).toBe('')
     if (expectStdoutLines) {
-        expect(stdout.split('\n').map(x => x.trim()).filter(x => !!x)).toEqual(expectStdoutLines)
+        const normalizeIsoOffset = (line) => line.replace(/(\d{2}:\d{2}:\d{2})Z\b/g, '$1+00:00')
+        expect(stdout.split('\n').map(x => normalizeIsoOffset(x.trim())).filter(x => !!x)).toEqual(expectStdoutLines.map(normalizeIsoOffset))
     }
     return { stdout, stderr }
 }
@@ -38,6 +39,20 @@ async function addGitRepoCommit (folder, repoPath, data, timeIndex, message, { c
     await exec(`GIT_COMMITTER_DATE="${commiterDate}" git -C ${folder} -c user.name="${commiterName}" -c user.email=${commiterEmail} commit --author='${authorName} <${authorEmail}>' --date "${authorDate}" -am '${message}'`)
 }
 
+async function addGitRepoTag (folder, tagName, ref = 'HEAD', {
+    annotated = false,
+    message = 'tag message',
+    taggerName = 'Tagger',
+    taggerEmail = 'tagger@example.com',
+    taggerDate = '2020-01-03T00:00:00Z',
+} = {}) {
+    if (annotated) {
+        await exec(`GIT_COMMITTER_DATE="${taggerDate}" git -C ${folder} -c user.name="${taggerName}" -c user.email=${taggerEmail} tag -a ${tagName} -m '${message}' ${ref}`)
+    } else {
+        await exec(`git -C ${folder} tag ${tagName} ${ref}`)
+    }
+}
+
 async function prepareGitRepo (folder) {
     const filename = 'test.txt'
     const renamedFilename = 'Test.txt'
@@ -53,6 +68,10 @@ async function prepareGitRepo (folder) {
     await addGitRepoCommit(folder, `${renamedFilename}.link`, renamedFilename, 3, 'create link', { mode: 'link' })
     await addGitRepoCommit(folder, 'sTest.txt', text1, 4, 'another file')
     await addGitRepoCommit(folder, path.join('bin', 'script.js'), '#!/usr/bin/env node\nconsole.log(911)\n', 5, 'add script!', { chmod: '+x' })
+}
+
+function getStdoutLines (stdout) {
+    return stdout.split('\n').map(x => x.trim()).filter(x => !!x)
 }
 
 const DEFAULT_PREPARE_GIT_REPO_PATHS = [
@@ -185,6 +204,36 @@ test('gitexporter save git history', async () => {
     )
 
     await run(`git -C ${folder}-target log -p`, DEFAULT_PREPARE_GIT_REPO_HISTORY)
+})
+
+test('gitexporter exports lightweight and annotated tags', async () => {
+    const folder = 'ignore.tags-export'
+    const config = `{
+  "forceReCreateRepo": true,
+  "targetRepoPath": "${folder}-target",
+  "sourceRepoPath": "${folder}"
+}`
+
+    await run(`rm -rf ${folder}*`)
+    await exec(`mkdir -p ${folder}`)
+    await exec(`git -C ${folder} init`)
+    await addGitRepoCommit(folder, 'file.txt', 'one', 0, 'c1')
+    await addGitRepoTag(folder, 'lw-1')
+    await addGitRepoCommit(folder, 'file.txt', 'two', 1, 'c2')
+    await addGitRepoTag(folder, 'ann-2', 'HEAD', {
+        annotated: true,
+        message: 'annotated tag msg',
+    })
+    await writeFileAtomic(`${folder}.config.json`, config)
+    await run(`node --unhandled-rejections=strict index.js ${folder}.config.json`)
+
+    const sourceTags = await run(`git -C ${folder} show-ref --tags -d`)
+    const targetTags = await run(`git -C ${folder}-target show-ref --tags -d`)
+    expect(getStdoutLines(targetTags.stdout)).toEqual(getStdoutLines(sourceTags.stdout))
+
+    const sourceAnnotatedTag = await run(`git -C ${folder} cat-file -p refs/tags/ann-2`)
+    const targetAnnotatedTag = await run(`git -C ${folder}-target cat-file -p refs/tags/ann-2`)
+    expect(targetAnnotatedTag.stdout).toEqual(sourceAnnotatedTag.stdout)
 })
 
 test('gitexporter allowed paths', async () => {
@@ -568,6 +617,38 @@ test('gitexporter follow by logfile', async () => {
         '+Initial text',
         '\\ No newline at end of file',
     ])
+})
+
+test('gitexporter follow by logfile syncs tags added after export', async () => {
+    const folder = 'ignore.follow-tags'
+    const config = `{
+  "forceReCreateRepo": false,
+  "followByLogFile": true,
+  "targetRepoPath": "${folder}-target",
+  "sourceRepoPath": "${folder}"
+}`
+
+    await run(`rm -rf ${folder}*`)
+    await exec(`mkdir -p ${folder}`)
+    await exec(`git -C ${folder} init`)
+    await addGitRepoCommit(folder, 'file.txt', 'one', 0, 'c1')
+    await writeFileAtomic(`${folder}.config.json`, config)
+    await run(`node --unhandled-rejections=strict index.js ${folder}.config.json`)
+
+    await addGitRepoTag(folder, 'lw-post')
+    await addGitRepoTag(folder, 'ann-post', 'HEAD', {
+        annotated: true,
+        message: 'follow mode tag',
+    })
+    await run(`node --unhandled-rejections=strict index.js ${folder}.config.json`)
+
+    const sourceTags = await run(`git -C ${folder} show-ref --tags -d`)
+    const targetTags = await run(`git -C ${folder}-target show-ref --tags -d`)
+    expect(getStdoutLines(targetTags.stdout)).toEqual(getStdoutLines(sourceTags.stdout))
+
+    const sourceAnnotatedTag = await run(`git -C ${folder} cat-file -p refs/tags/ann-post`)
+    const targetAnnotatedTag = await run(`git -C ${folder}-target cat-file -p refs/tags/ann-post`)
+    expect(targetAnnotatedTag.stdout).toEqual(sourceAnnotatedTag.stdout)
 })
 
 test('gitexporter follow by number of commits', async () => {

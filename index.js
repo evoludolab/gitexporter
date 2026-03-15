@@ -90,6 +90,62 @@ async function getCommitHistory (repo) {
     })
 }
 
+async function getTagData (repo, tagName) {
+    const refName = `refs/tags/${tagName}`
+    const ref = await Git.Reference.lookup(repo, refName)
+    const commitRef = await ref.peel(Git.Object.TYPE.COMMIT)
+    const commit = await Git.Commit.lookup(repo, commitRef.id())
+    const tagOid = await Git.Reference.nameToId(repo, refName)
+
+    try {
+        const tagObject = await Git.Tag.lookup(repo, tagOid)
+        const tagger = tagObject.tagger()
+        const when = tagger.when()
+
+        return {
+            name: tagName,
+            commitSha: commit.sha(),
+            annotated: true,
+            message: tagObject.message(),
+            tagger: {
+                name: tagger.name(),
+                email: tagger.email(),
+                time: when.time(),
+                offset: when.offset(),
+            },
+        }
+    } catch (error) {
+        const isLightweightTag =
+            error.message.search('object not found') !== -1 ||
+            error.message.search('requested type does not match') !== -1
+        if (!isLightweightTag) throw error
+        return {
+            name: tagName,
+            commitSha: commit.sha(),
+            annotated: false,
+        }
+    }
+}
+
+async function syncCommitTags (targetRepo, targetCommitSha, tags) {
+    if (!tags || tags.length === 0) return
+
+    const targetCommit = await Git.Commit.lookup(targetRepo, targetCommitSha)
+    for (const tag of tags) {
+        if (tag.annotated) {
+            const tagger = Git.Signature.create(
+                tag.tagger.name,
+                tag.tagger.email,
+                tag.tagger.time,
+                tag.tagger.offset,
+            )
+            await Git.Tag.create(targetRepo, tag.name, targetCommit, tagger, tag.message, 1)
+        } else {
+            await Git.Tag.createLightweight(targetRepo, tag.name, targetCommit, 1)
+        }
+    }
+}
+
 async function commitFiles (repo, author, committer, message, files) {
     if (DEBUG) console.log('commitFiles()', files.length)
     const index = await repo.refreshIndex()
@@ -477,33 +533,23 @@ async function main (config, args) {
     const targetHeadCommit = await targetRepo.getHeadCommit()
     const targetCommits = await getCommitHistory(targetHeadCommit) // getHeadCommit ?
 
-    // generate map between commit sha and tag name
+    // generate map between commit sha and tags
     const tags = await Git.Tag.list(sourceRepo)
     const tagMap = new Map()
     for (const tag of tags) {
-        const commit = await Git.Reference.lookup(sourceRepo, `refs/tags/${tag}`)
-            .then(ref => ref.peel(Git.Object.TYPE.COMMIT))
-            .then(ref => Git.Commit.lookup(sourceRepo, ref.id())) // ref.id() now
-            .then(commit => ({
-                sha: commit.sha(),
-                author: commit.author(),
-                committer: commit.committer(),
-                date: commit.date(),
-                offset: commit.timeOffset(),
-                message: commit.message(),
-            }))
+        const tagData = await getTagData(sourceRepo, tag)
         // commit may have multiple tags
-        if (tagMap.has(commit.sha)) {
+        if (tagMap.has(tagData.commitSha)) {
             if (DEBUG)
-                console.log('tag already exists:', tag, commit.sha)
-            const existingtag = tagMap.get(commit.sha)
-            existingtag.push(tag)
-            tagMap.set(commit.sha, existingtag)
+                console.log('tag already exists:', tag, tagData.commitSha)
+            const existingTags = tagMap.get(tagData.commitSha)
+            existingTags.push(tagData)
+            tagMap.set(tagData.commitSha, existingTags)
+        } else {
+            tagMap.set(tagData.commitSha, [ tagData ])
         }
-        else
-            tagMap.set(commit.sha, [ tag ])
         if (DEBUG)
-            console.log('tag found:', tag, commit.sha)
+            console.log('tag found:', tag, tagData.commitSha)
     }
 
     if (isFollowByLogFileFeatureEnabled) {
@@ -553,6 +599,7 @@ async function main (config, args) {
                     lastTargetCommit = newSha
                     // we also need to update commit.processing data
                     commit.processing = existingCommit.processing
+                    await syncCommitTags(targetRepo, newSha, tagMap.get(commit.sha))
                     continue
                 } else {
                     isFollowByOk = false
@@ -585,6 +632,7 @@ async function main (config, args) {
                 commit.processing.newSha = targetCommit.sha
                 lastFollowCommit = targetCommit.sha
                 lastTargetCommit = targetCommit.sha
+                await syncCommitTags(targetRepo, targetCommit.sha, tagMap.get(commit.sha))
                 continue
             } else {
                 isFollowByOk = false
@@ -642,23 +690,7 @@ async function main (config, args) {
         const newSha = await commitFiles(targetRepo, commit.author, commit.committer, commit.message, files)
         lastTargetCommit = newSha
 
-        if (tagMap.has(commit.sha)) {
-            const tags = tagMap.get(commit.sha)
-            for (const tag of tags) {
-                const tagSHA = (await Git.Reference.nameToId(sourceRepo, `refs/tags/${tag}`)).toString();
-                if (tagSHA === commit.sha) {
-                    // lightweight tag
-                    if (DEBUG) 
-                        console.log('Creating lightweight tag:', tag, newSha)
-                    await targetRepo.createLightweightTag(newSha, tag)
-                } else {
-                    // annotated tag
-                    if (DEBUG) 
-                        console.log('Creating annotated tag:', tag, newSha)
-                    await targetRepo.createTag(newSha, tag, commit.message)
-                }
-            }
-        }
+        await syncCommitTags(targetRepo, newSha, tagMap.get(commit.sha))
 
         time1 = time2
         time2 = Date.now()
